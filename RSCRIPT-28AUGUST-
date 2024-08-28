@@ -1,0 +1,336 @@
+# Load required libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load("tidyverse", "haven", "ggplot2", "corrplot", "car", "lmtest", 
+               "sandwich", "survey", "margins", "stargazer", "knitr", "kableExtra",
+               "effects", "sjPlot", "gridExtra", "ggeffects", "ResourceSelection")
+
+
+library(haven)
+qlfs_2011 <- read_sav("C:/Users/uniab/FREELANCING/MADHU-QLFS/Dataset/dataset-original/qlfs_2011_teaching_dataset_final_july.sav")
+View(qlfs_2011)
+
+
+# Data cleaning and preprocessing
+qlfs_clean <- qlfs_2011 %>%
+  select(hiqul11d, ilodefr, stat3r, ftptwk, tothrs, nsecmj3r, govtof2, pwt10) %>%
+  mutate(across(where(is.labelled), ~as_factor(.))) %>%
+  mutate(
+    region_group = case_when(
+      govtof2 %in% c("North East", "North West (inc Merseyside)", "Yorkshire and Humberside") ~ "North",
+      govtof2 %in% c("East Midlands", "West Midlands", "Eastern") ~ "Midlands",
+      govtof2 %in% c("London", "South East", "South West") ~ "South",
+      govtof2 %in% c("Wales", "Scotland", "Northern Ireland") ~ "Other UK Countries",
+      TRUE ~ NA_character_
+    ),
+    employment_status = case_when(
+      ilodefr == "In employment" ~ "Employed",
+      ilodefr == "ILO unemployed" ~ "Unemployed",
+      ilodefr == "Inactive" ~ "Inactive",
+      TRUE ~ NA_character_
+    ),
+    tothrs = as.numeric(as.character(tothrs)),
+    pwt10 = as.numeric(as.character(pwt10))
+  ) %>%
+  mutate(
+    hours_category = cut(tothrs, 
+                         breaks = c(-Inf, 0, 20, 35, 48, Inf), 
+                         labels = c("Not applicable", "Part-time", "Full-time (20-35)", "Full-time (35-48)", "Full-time (>48)"),
+                         include.lowest = TRUE)
+  ) %>%
+  select(-ilodefr, -govtof2)
+
+
+# Handle missing values
+qlfs_clean <- qlfs_clean %>%
+  mutate(across(where(is.factor), ~fct_na_value_to_level(., level = "(Missing)"))) %>%
+  mutate(across(c(tothrs, pwt10), ~if_else(. %in% c(-9, -8), NA_real_, .))) %>%
+  mutate(across(where(is.factor), ~fct_drop(.)))
+
+# Remove rows with missing weights
+qlfs_clean <- qlfs_clean %>% filter(!is.na(pwt10))
+
+# Ensure all relevant variables are factors
+qlfs_clean <- qlfs_clean %>%
+  mutate(
+    hiqul11d = factor(hiqul11d),
+    region_group = factor(region_group),
+    employment_status = factor(employment_status),
+    nsecmj3r = factor(nsecmj3r),
+    ftptwk = factor(ftptwk)
+  )
+
+
+# Create survey design object
+qlfs_design <- svydesign(ids = ~1, weights = ~pwt10, data = qlfs_clean)
+
+
+# Descriptive Statistics
+desc_stats <- qlfs_clean %>%
+  select(employment_status, region_group, hiqul11d, nsecmj3r, ftptwk, tothrs) %>%
+  summary()
+
+print(desc_stats)
+
+
+# Weighted proportions
+prop_emp_status <- svymean(~employment_status, qlfs_design, na.rm = TRUE)
+prop_region <- svymean(~region_group, qlfs_design, na.rm = TRUE)
+prop_qual <- svymean(~hiqul11d, qlfs_design, na.rm = TRUE)
+
+print(prop_emp_status)
+print(prop_region)
+print(prop_qual)
+
+
+# Cross-tabulations
+cross_tab_region_emp <- svytable(~region_group + employment_status, qlfs_design)
+cross_tab_qual_emp <- svytable(~hiqul11d + employment_status, qlfs_design)
+
+print(cross_tab_region_emp)
+print(cross_tab_qual_emp)
+
+
+# Visualizations
+# Employment status distribution
+p1 <- ggplot(qlfs_clean, aes(x = employment_status, fill = employment_status, weight = pwt10)) +
+  geom_bar() +
+  labs(title = "Weighted Distribution of Employment Status",
+       x = "Employment Status",
+       y = "Weighted Count") +
+  theme_minimal()
+
+# Total hours worked by region
+p2 <- ggplot(qlfs_clean %>% filter(!is.na(tothrs) & is.finite(tothrs)), 
+             aes(x = region_group, y = tothrs, weight = pwt10)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Total Hours Worked by Region",
+       x = "Region",
+       y = "Total Hours Worked") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+
+
+# Employment by qualification and region
+employment_by_qual <- svyby(~factor(employment_status), ~hiqul11d, qlfs_design, svymean)
+employment_by_region <- svyby(~factor(employment_status), ~region_group, qlfs_design, svymean)
+
+# Reshape the data for plotting
+employment_by_qual_long <- employment_by_qual %>%
+  pivot_longer(cols = starts_with("factor"), names_to = "status", values_to = "proportion") %>%
+  filter(status == "factor(employment_status)Employed")
+
+employment_by_region_long <- employment_by_region %>%
+  pivot_longer(cols = starts_with("factor"), names_to = "status", values_to = "proportion") %>%
+  filter(status == "factor(employment_status)Employed")
+
+# Create plots
+p3 <- ggplot(employment_by_qual_long, aes(x = hiqul11d, y = proportion, fill = hiqul11d)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Employment Rate by Qualification", x = "Qualification", y = "Employment Rate")
+
+p4 <- ggplot(employment_by_region_long, aes(x = region_group, y = proportion, fill = region_group)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Employment Rate by Region", x = "Region", y = "Employment Rate")
+
+grid.arrange(p3, p4, ncol = 2)
+
+# Hours distribution by qualification
+hours_by_qual <- svyby(~hours_category, ~hiqul11d, qlfs_design, svymean)
+
+# Reshape the data for plotting
+hours_by_qual_long <- hours_by_qual %>%
+  pivot_longer(cols = starts_with("hours_category"), 
+               names_to = "hours_category", 
+               values_to = "proportion") %>%
+  mutate(hours_category = str_remove(hours_category, "hours_category"))
+
+# Create the plot
+p5 <- ggplot(hours_by_qual_long, aes(x = hiqul11d, y = proportion, fill = hours_category)) +
+  geom_bar(stat = "identity", position = "fill") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of Working Hours by Qualification", 
+       x = "Qualification", y = "Proportion") +
+  scale_fill_brewer(palette = "Set3")
+
+# Display the plot
+print(p5)
+
+# Socio-economic classification analysis
+nsec_dist <- svymean(~nsecmj3r, qlfs_design, na.rm = TRUE)
+print(nsec_dist)
+
+nsec_emp <- svyby(~factor(employment_status), ~nsecmj3r, qlfs_design, svymean)
+
+
+# Reshape the data for plotting
+nsec_emp_long <- nsec_emp %>%
+  pivot_longer(cols = starts_with("factor"), names_to = "status", values_to = "proportion") %>%
+  filter(status == "factor(employment_status)Employed")
+
+# Create the plot
+p6 <- ggplot(nsec_emp_long, aes(x = nsecmj3r, y = proportion, fill = nsecmj3r)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Employment Rate by Socio-economic Classification", 
+       x = "NS-SEC", y = "Employment Rate") +
+  scale_fill_brewer(palette = "Set3")
+
+# Display the plot
+print(p6)
+
+# Correlation Analysis
+numeric_vars <- qlfs_clean %>% select_if(is.numeric)
+cor_matrix <- cor(numeric_vars, use = "pairwise.complete.obs")
+corrplot(cor_matrix, method = "color")
+
+# Statistical Tests
+# Chi-square tests
+chisq_qual_emp <- svychisq(~hiqul11d + employment_status, qlfs_design)
+chisq_region_emp <- svychisq(~region_group + employment_status, qlfs_design)
+
+print(chisq_qual_emp)
+print(chisq_region_emp)
+
+
+# T-test (comparing North and South regions)
+ttest_region <- svyttest(tothrs ~ I(region_group %in% c("North", "South")), qlfs_design)
+print(ttest_region)
+
+
+# ANOVA
+anova_qual <- svyglm(tothrs ~ hiqul11d, design = qlfs_design)
+anova_region <- svyglm(tothrs ~ region_group, design = qlfs_design)
+
+print(summary(anova_qual))
+print(summary(anova_region))
+
+
+# Regression Analysis
+# Linear Regression (Total Hours Worked)
+lm_model <- svyglm(tothrs ~ hiqul11d + region_group + nsecmj3r + ftptwk, design = qlfs_design)
+summary(lm_model)
+
+# Linear regression with interactions
+lm_model_int <- svyglm(tothrs ~ hiqul11d * region_group + nsecmj3r + ftptwk, design = qlfs_design)
+summary(lm_model_int)
+
+
+
+# Create a data frame with predicted values
+pred_data <- expand.grid(
+  hiqul11d = levels(qlfs_clean$hiqul11d),
+  region_group = levels(qlfs_clean$region_group),
+  nsecmj3r = levels(qlfs_clean$nsecmj3r)[1],  # Use the first level as reference
+  ftptwk = levels(qlfs_clean$ftptwk)[1]  # Use the first level as reference
+)
+
+# Predict values
+pred_data$predicted <- predict(lm_model_int, newdata = pred_data, type = "response")
+
+# Create the interaction plot
+ggplot(pred_data, aes(x = hiqul11d, y = predicted, color = region_group, group = region_group)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Interaction between Highest Qualification and Region",
+       x = "Highest Qualification",
+       y = "Predicted Total Hours Worked",
+       color = "Region") +
+  scale_color_brewer(palette = "Set1")
+
+# Save the plot
+ggsave("interaction_plot.png", width = 12, height = 8)
+
+
+# Logistic Regression (Employment Status)
+logit_model <- svyglm(I(employment_status == "Employed") ~ hiqul11d + region_group + nsecmj3r, 
+                      family = quasibinomial(), design = qlfs_design)
+summary(logit_model)
+
+# Logistic regression with interactions
+logit_model_int <- svyglm(I(employment_status == "Employed") ~ hiqul11d * region_group + nsecmj3r, 
+                          family = quasibinomial(), design = qlfs_design)
+summary(logit_model_int)
+
+# Odds ratios
+odds_ratios <- exp(coef(logit_model))
+print(odds_ratios)
+
+odds_ratios_int <- exp(coef(logit_model_int))
+print(odds_ratios_int)
+
+
+# Marginal effects analysis
+margins_lm <- margins(lm_model_int)
+summary(margins_lm)
+
+margins_logit <- margins(logit_model_int)
+summary(margins_logit)
+
+
+# Model diagnostics
+# For linear regression
+plot(lm_model_int)
+vif(lm_model_int)
+
+# For logistic regression
+hoslem.test(logit_model_int$y, fitted(logit_model_int))
+
+
+# Summary tables
+summary_table <- stargazer(lm_model, lm_model_int, logit_model, logit_model_int,
+                           type = "text", 
+                           title = "Regression Results",
+                           align = TRUE)
+
+print(summary_table)
+
+# Save all plots and results
+ggsave("employment_status_distribution.png", p1, width = 10, height = 6)
+ggsave("hours_worked_by_region.png", p2, width = 10, height = 6)
+ggsave("employment_by_qualification.png", p3, width = 10, height = 6)
+ggsave("employment_by_region.png", p4, width = 10, height = 6)
+ggsave("hours_distribution_by_qualification.png", p5, width = 10, height = 6)
+ggsave("employment_by_nsec.png", p6, width = 10, height = 6)
+
+write.csv(cross_tab_region_emp, "region_employment_crosstab.csv")
+write.csv(cross_tab_qual_emp, "qualification_employment_crosstab.csv")
+write.csv(employment_by_qual, "employment_by_qualification.csv")
+write.csv(employment_by_region, "employment_by_region.csv")
+write.csv(hours_by_qual, "hours_by_qualification.csv")
+write.csv(nsec_emp, "employment_by_nsec.csv")
+
+
+sink("regression_results.txt")
+print(summary_table)
+sink()
+
+sink("marginal_effects_summary.txt")
+summary(margins_lm)
+summary(margins_logit)
+sink()
+
+# Key Findings
+cat("\nKey Findings:\n")
+cat("1. Chi-square test (Qualification and Employment):", chisq_qual_emp$p.value, "\n")
+cat("2. Chi-square test (Region and Employment):", chisq_region_emp$p.value, "\n")
+cat("3. T-test (North vs South total hours):", ttest_region$p.value, "\n")
+cat("4. ANOVA (Qualification and total hours) p-value:", summary(anova_qual)$coefficients[-1, "Pr(>|t|)"], "\n")
+cat("5. ANOVA (Region and total hours) p-value:", summary(anova_region)$coefficients[-1, "Pr(>|t|)"], "\n")
+cat("6. Linear Regression R-squared:", summary(lm_model_int)$r.squared, "\n")
+cat("7. Logistic Regression (employment status) significant predictors:\n")
+print(summary(logit_model_int)$coefficients[summary(logit_model_int)$coefficients[,4] < 0.05, ])
+
+
+
+
+
+
+
+
+
+
+
